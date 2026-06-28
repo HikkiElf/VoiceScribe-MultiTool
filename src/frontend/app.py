@@ -74,7 +74,6 @@ class VoiceScribeMultiToolApp(QMainWindow):
         token_layout.addWidget(self.token_input, 1)
 
         self.btn_toggle_token = QPushButton("Показать")
-        self.btn_toggle_token.setFixedWidth(75)
         self.btn_toggle_token.clicked.connect(self.toggle_token_visibility)
         token_layout.addWidget(self.btn_toggle_token)
 
