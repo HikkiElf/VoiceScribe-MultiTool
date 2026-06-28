@@ -1,0 +1,398 @@
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from dotenv import load_dotenv
+import gigaam
+import numpy as np
+import scipy.io.wavfile as wavf
+import sounddevice as sd
+
+# Загружаем переменные из .env файла
+load_dotenv()
+
+# Configuration Constants
+MODEL_NAME = "v3_e2e_rnnt"
+SAMPLE_RATE = 16000
+CHUNK_DURATION = 5
+SILENCE_THRESHOLD = 0.02
+
+
+class TranscriptionApp:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GigaAM & WhisperX Studio")
+        self.root.geometry("650x730")
+        self.root.minsize(550, 600)
+
+        # State variables (GigaAM)
+        self.model = None
+        self.is_recording = False
+        self.output_file_path = ""
+        self.audio_file_path = ""
+        self.audio_queue = queue.Queue()
+        self.full_audio_data = []
+        self.stream = None
+        self.device_mapping = {}
+
+        # State variables (WhisperX)
+        self.whisper_audio_path = ""
+
+        # Build UI Elements
+        self.setup_ui()
+
+        self.log("Инициализация модели GigaAM... Пожалуйста, подождите.")
+        threading.Thread(target=self.load_model_async, daemon=True).start()
+
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self.tab_giga = ttk.Frame(self.notebook, padding=10)
+        self.tab_whisper = ttk.Frame(self.notebook, padding=10)
+
+        self.notebook.add(self.tab_giga, text=" 🎙️ Живая запись (GigaAM) ")
+        self.notebook.add(self.tab_whisper, text=" 👥 Разделение ролей (WhisperX) ")
+
+        # ВКЛАДКА 1
+        device_frame = ttk.LabelFrame(self.tab_giga, text=" Микрофон / Входной источник ", padding="10")
+        device_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.device_var = tk.StringVar()
+        self.device_dropdown = ttk.Combobox(device_frame, textvariable=self.device_var, state="readonly")
+        self.device_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+
+        refresh_btn = ttk.Button(device_frame, text="Обновить", command=self.populate_devices)
+        refresh_btn.pack(side=tk.RIGHT)
+        self.populate_devices()
+
+        file_frame = ttk.LabelFrame(self.tab_giga, text=" Куда сохранять текст (.txt) ", padding="10")
+        file_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.file_var = tk.StringVar(value="Файл не выбран...")
+        file_label = ttk.Label(file_frame, textvariable=self.file_var, wraplength=400, anchor="w")
+        file_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+
+        browse_btn = ttk.Button(file_frame, text="Обзор...", command=self.browse_file)
+        browse_btn.pack(side=tk.RIGHT)
+
+        audio_save_frame = ttk.LabelFrame(self.tab_giga, text=" Запись мастер-аудио для WhisperX (.wav) ", padding="10")
+        audio_save_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.save_audio_var = tk.BooleanVar(value=False)
+        self.chk_save_audio = ttk.Checkbutton(
+            audio_save_frame, text="Параллельно записывать чистый звук в файл",
+            variable=self.save_audio_var, command=self.toggle_audio_fields
+        )
+        self.chk_save_audio.pack(anchor="w", pady=(0, 5))
+
+        self.audio_path_subframe = ttk.Frame(audio_save_frame)
+        self.audio_path_subframe.pack(fill=tk.X)
+
+        self.audio_file_var = tk.StringVar(value="Запись звука отключена...")
+        self.audio_label = ttk.Label(self.audio_path_subframe, textvariable=self.audio_file_var, wraplength=400, anchor="w", state=tk.DISABLED)
+        self.audio_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+
+        self.audio_browse_btn = ttk.Button(self.audio_path_subframe, text="Обзор...", command=self.browse_audio_file, state=tk.DISABLED)
+        self.audio_browse_btn.pack(side=tk.RIGHT)
+
+        self.start_btn = ttk.Button(self.tab_giga, text="Запустить транскрибацию", command=self.toggle_transcription, state=tk.DISABLED)
+        self.start_btn.pack(fill=tk.X, ipady=8, pady=(10, 0))
+
+        # ВКЛАДКА 2
+        wx_frame = ttk.LabelFrame(self.tab_whisper, text=" Постобработка готовой записи ", padding="15")
+        wx_frame.pack(fill=tk.X, pady=10)
+
+        wx_desc = ttk.Label(wx_frame, text="Выберите аудиофайл (.wav), отметьте необходимые форматы документов ниже и запустите WhisperX.", justify=tk.LEFT)
+        wx_desc.pack(anchor="w", pady=(0, 15))
+
+        wx_file_subframe = ttk.Frame(wx_frame)
+        wx_file_subframe.pack(fill=tk.X, pady=(0, 15))
+
+        self.wx_file_var = tk.StringVar(value="Файл для обработки не выбран...")
+        wx_file_label = ttk.Label(wx_file_subframe, textvariable=self.wx_file_var, wraplength=400, anchor="w")
+        wx_file_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+
+        wx_browse_btn = ttk.Button(wx_file_subframe, text="Выбрать файл...", command=self.browse_whisper_file)
+        wx_browse_btn.pack(side=tk.RIGHT)
+
+        formats_frame = ttk.LabelFrame(wx_frame, text=" Какие файлы вам нужны на выходе? ", padding="10")
+        formats_frame.pack(fill=tk.X, pady=(0, 15))
+
+        self.wx_txt_var = tk.BooleanVar(value=True)
+        self.wx_srt_var = tk.BooleanVar(value=True)
+        self.wx_tsv_var = tk.BooleanVar(value=True)
+        self.wx_json_var = tk.BooleanVar(value=True)
+        self.wx_vtt_var = tk.BooleanVar(value=True)
+
+        ttk.Checkbutton(formats_frame, text="TXT (Текст с ролями)", variable=self.wx_txt_var).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(formats_frame, text="SRT (Субтитры)", variable=self.wx_srt_var).grid(row=0, column=1, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(formats_frame, text="TSV (Таблица Excel)", variable=self.wx_tsv_var).grid(row=0, column=2, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(formats_frame, text="JSON (Данные слов)", variable=self.wx_json_var).grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        ttk.Checkbutton(formats_frame, text="VTT (Web-субтитры)", variable=self.wx_vtt_var).grid(row=1, column=1, sticky="w", padx=10, pady=5)
+
+        self.whisper_btn = ttk.Button(wx_frame, text="🚀 Запустить разделение спикеров (WhisperX)", command=self.start_whisperx)
+        self.whisper_btn.pack(fill=tk.X, ipady=8)
+
+        # ЛОГИ
+        log_frame = ttk.LabelFrame(main_frame, text=" 📊 Мониторинг и вывод в реальном времени ", padding="10")
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        log_tools = ttk.Frame(log_frame)
+        log_tools.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(log_tools, text="📋 Скопировать весь лог в буфер", command=self.copy_log_to_clipboard).pack(side=tk.RIGHT)
+
+        self.log_text = tk.Text(log_frame, height=10, wrap=tk.WORD, state=tk.DISABLED)
+        self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text["yscrollcommand"] = scrollbar.set
+
+    def copy_log_to_clipboard(self):
+        try:
+            self.log_text.config(state=tk.NORMAL)
+            content = self.log_text.get("1.0", tk.END).strip()
+            self.log_text.config(state=tk.DISABLED)
+            if content:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(content)
+                self.root.update()
+                messagebox.showinfo("Успех", "Лог скопирован!")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def load_model_async(self):
+        try:
+            self.model = gigaam.load_model(MODEL_NAME)
+            self.log("Модель GigaAM успешно загружена! Все готово к работе.")
+            self.start_btn.config(state=tk.NORMAL)
+        except Exception as e:
+            self.log(f"Ошибка загрузки модели GigaAM: {e}")
+
+    def populate_devices(self):
+        try:
+            devices = sd.query_devices()
+            input_device_names = []
+            self.device_mapping.clear()
+            for i, dev in enumerate(devices):
+                if dev["max_input_channels"] > 0:
+                    display_name = f"{dev['name']} (ID: {i})"
+                    input_device_names.append(display_name)
+                    self.device_mapping[display_name] = i
+            self.device_dropdown["values"] = input_device_names
+            default_input = sd.query_devices(kind="input")
+            for name, idx in self.device_mapping.items():
+                if idx == default_input.get("index", -1):
+                    self.device_dropdown.set(name)
+                    break
+        except Exception as e:
+            self.log(f"Ошибка сканирования устройств: {e}")
+
+    def toggle_audio_fields(self):
+        if self.save_audio_var.get():
+            self.audio_label.config(state=tk.NORMAL)
+            self.audio_browse_btn.config(state=tk.NORMAL)
+        else:
+            self.audio_label.config(state=tk.DISABLED)
+            self.audio_browse_btn.config(state=tk.DISABLED)
+
+    def browse_file(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt")])
+        if file_path:
+            self.output_file_path = file_path
+            self.file_var.set(os.path.basename(file_path))
+
+    def browse_audio_file(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".wav", filetypes=[("WAV Audio", "*.wav")])
+        if file_path:
+            self.audio_file_path = file_path
+            self.audio_file_var.set(os.path.basename(file_path))
+
+    def log(self, message):
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
+    # УЛУЧШЕННЫЙ ОБРАБОТЧИК: Смешивает каналы (Микрофон + Slack) в один моно-сигнал
+    def audio_callback(self, indata, frames, time_info, status):
+        if status:
+            print(status, file=sys.stderr)
+        if self.is_recording:
+            if indata.shape[1] > 1:
+                # Если каналов несколько, берем их среднее арифметическое (микшируем)
+                mono_data = np.mean(indata, axis=1, keepdims=True)
+            else:
+                mono_data = indata.copy()
+            self.audio_queue.put(mono_data)
+
+    def toggle_transcription(self):
+        if not self.is_recording:
+            if not self.output_file_path or not self.device_var.get():
+                messagebox.showwarning("Внимание", "Заполните настройки.")
+                return
+            if self.save_audio_var.get() and not self.audio_file_path:
+                messagebox.showwarning("Внимание", "Укажите путь для .wav файла.")
+                return
+
+            self.is_recording = True
+            self.start_btn.config(text="⏹️ Остановить и сохранить всё")
+            self.device_dropdown.config(state=tk.DISABLED)
+
+            while not self.audio_queue.empty():
+                self.audio_queue.get()
+            self.full_audio_data = []
+
+            threading.Thread(target=self.transcription_processor, daemon=True).start()
+        else:
+            self.is_recording = False
+            if self.stream:
+                self.stream.stop()
+                self.stream.close()
+            self.start_btn.config(text="Запустить транскрибацию")
+            self.device_dropdown.config(state="readonly")
+            self.toggle_audio_fields()
+
+    # УЛУЧШЕННЫЙ ПОТОК: Автоматически открывает все доступные каналы устройства
+    def transcription_processor(self):
+        device_id = self.device_mapping[self.device_var.get()]
+
+        try:
+            device_info = sd.query_devices(device_id, 'input')
+            channels = int(device_info['max_input_channels'])
+        except Exception:
+            channels = 1
+
+        samples_per_chunk = SAMPLE_RATE * CHUNK_DURATION
+        audio_buffer = []
+
+        try:
+            self.stream = sd.InputStream(
+                device=device_id, samplerate=SAMPLE_RATE, channels=channels, callback=self.audio_callback, blocksize=int(SAMPLE_RATE * 0.5)
+            )
+
+            with self.stream:
+                with open(self.output_file_path, "a", encoding="utf-8") as txt_file:
+                    while self.is_recording:
+                        try:
+                            data = self.audio_queue.get(timeout=1.0)
+                            audio_buffer.append(data)
+                            if self.save_audio_var.get():
+                                self.full_audio_data.append(data)
+
+                            current_audio = np.concatenate(audio_buffer, axis=0)
+
+                            if len(current_audio) >= samples_per_chunk:
+                                audio_buffer = []
+                                if np.max(np.abs(current_audio)) < SILENCE_THRESHOLD:
+                                    continue
+
+                                temp_wav = f"ui_temp_{int(time.time())}.wav"
+                                wavf.write(temp_wav, SAMPLE_RATE, current_audio)
+
+                                try:
+                                    result = self.model.transcribe(temp_wav)
+                                    text = result.text.strip()
+                                    if text:
+                                        self.log(f"Распознано: {text}")
+                                        txt_file.write(text + " ")
+                                        txt_file.flush()
+                                except Exception as e:
+                                    self.log(f"Ошибка инференса: {e}")
+                                finally:
+                                    if os.path.exists(temp_wav):
+                                        os.remove(temp_wav)
+                        except queue.Empty:
+                            continue
+
+            if self.save_audio_var.get() and self.full_audio_data:
+                self.log("Экспорт мастер-аудио на диск...")
+                full_audio = np.concatenate(self.full_audio_data, axis=0)
+                wavf.write(self.audio_file_path, SAMPLE_RATE, full_audio)
+                self.log(f"🎉 Аудио успешно сохранено: {os.path.basename(self.audio_file_path)}")
+
+            self.log("🏁 Процесс полностью завершен.")
+        except Exception as e:
+            self.log(f"Критическая ошибка аудиопотока: {e}")
+            self.root.after(0, self.toggle_transcription)
+
+    def browse_whisper_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav *.mp3 *.m4a")])
+        if file_path:
+            self.whisper_audio_path = file_path
+            self.wx_file_var.set(os.path.basename(file_path))
+
+    def start_whisperx(self):
+        if not self.whisper_audio_path:
+            messagebox.showwarning("Внимание", "Выберите аудиофайл.")
+            return
+
+        selected_formats = []
+        if self.wx_txt_var.get(): selected_formats.append("txt")
+        if self.wx_srt_var.get(): selected_formats.append("srt")
+        if self.wx_tsv_var.get(): selected_formats.append("tsv")
+        if self.wx_json_var.get(): selected_formats.append("json")
+        if self.wx_vtt_var.get(): selected_formats.append("vtt")
+
+        if not selected_formats:
+            messagebox.showwarning("Внимание", "Выберите хотя бы один формат!")
+            return
+
+        hf_token = os.getenv("HUGGING_FACE_READ_TOKEN")
+        if not hf_token or hf_token.startswith("hf_какой_то_ваш"):
+            messagebox.showerror("Ошибка", "Проверьте токен в .env")
+            return
+
+        self.whisper_btn.config(state=tk.DISABLED)
+        threading.Thread(target=self.whisperx_worker, args=(hf_token, selected_formats), daemon=True).start()
+
+    def whisperx_worker(self, hf_token, selected_formats):
+        self.log(f"🚀 Запуск WhisperX для: {os.path.basename(self.whisper_audio_path)}")
+        output_dir = os.path.dirname(self.whisper_audio_path)
+        cmd = ["whisperx", self.whisper_audio_path, "--model", "large-v3", "--diarize", "--hf_token", hf_token, "--output_dir", output_dir]
+
+        if len(selected_formats) == 1:
+            cmd.extend(["--output_format", selected_formats[0]])
+        else:
+            cmd.extend(["--output_format", "all"])
+
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in process.stdout:
+                cleaned_line = line.strip()
+                if cleaned_line:
+                    self.root.after(0, self.log, f"[WhisperX] {cleaned_line}")
+            process.wait()
+
+            if process.returncode == 0:
+                if len(selected_formats) > 1 and len(selected_formats) < 5:
+                    all_formats = {"txt", "srt", "tsv", "json", "vtt"}
+                    unwanted_formats = all_formats - set(selected_formats)
+                    base_path, _ = os.path.splitext(self.whisper_audio_path)
+                    for fmt in unwanted_formats:
+                        unwanted_file = f"{base_path}.{fmt}"
+                        if os.path.exists(unwanted_file):
+                            os.remove(unwanted_file)
+                self.root.after(0, self.log, f"🎉 Успех! Файлы в папке: {output_dir}")
+        except Exception as e:
+            self.root.after(0, self.log, f"💥 Ошибка: {e}")
+        finally:
+            self.root.after(0, self.whisper_btn.config, {"state": tk.NORMAL})
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    style = ttk.Style()
+    style.theme_use("aqua")
+    app = TranscriptionApp(root)
+    root.mainloop()
