@@ -2,3 +2,4 @@ venv*
 hugtoken*
 .env*
 *.bak
+.DS_Store
