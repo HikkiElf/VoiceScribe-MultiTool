@@ -4,10 +4,10 @@ import sounddevice as sd
 from PyQt6.QtCore import QThread, pyqtSlot, Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QLabel, QComboBox, QPushButton, QCheckBox, QTextEdit,
-    QFileDialog, QMessageBox, QFrame, QProgressBar, QSpinBox, QLineEdit
+    QLabel, QComboBox, QPushButton, QCheckBox, QTextEdit,
+    QFileDialog, QMessageBox, QFrame, QProgressBar, QSpinBox, QLineEdit,
+    QListWidget, QStackedWidget
 )
-
 # Import dependencies from our backend and style config
 from .style import MODERN_STYLE
 from backend.workers import (
@@ -16,12 +16,11 @@ from backend.workers import (
 )
 
 class VoiceScribeMultiToolApp(QMainWindow):
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VoiceScribe-MultiTool")
-        self.resize(750, 900)
-        self.setMinimumSize(650, 800)
+        self.resize(1000, 800)
+        self.setMinimumSize(900, 700)
 
         self.model = None
         self.device_mapping = {}
@@ -85,21 +84,37 @@ class VoiceScribeMultiToolApp(QMainWindow):
 
         main_layout.addWidget(token_frame)
 
-        # Main Layout Navigation Tabs
-        self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
+        # Main Split Layout
+        split_layout = QHBoxLayout()
+        split_layout.setSpacing(16)
+
+        # Left Sidebar (Navigation)
+        self.sidebar = QListWidget()
+        self.sidebar.setObjectName("Sidebar")
+        self.sidebar.setFixedWidth(240)
+
+        self.sidebar.addItem("🎙️ Живая запись (GigaAM)")
+        self.sidebar.addItem("👥 Разделение (GigaAM MLX)")
+        self.sidebar.addItem("👥 Разделение (WhisperX)")
+
+        split_layout.addWidget(self.sidebar)
+
+        # Right Working Area
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(14)
+
+        self.stack = QStackedWidget()
 
         self.tab_giga = QWidget()
         self.tab_giga_diarize = QWidget()
         self.tab_whisper = QWidget()
 
-        self.tabs.addTab(self.tab_giga, " 🎙️  Живая запись (GigaAM) ")
-        self.tabs.addTab(self.tab_giga_diarize, " 👥  Разделение ролей (GigaAM MLX) ")
-        self.tabs.addTab(self.tab_whisper, " 👥  Разделение ролей (WhisperX) ")
+        self.stack.addWidget(self.tab_giga)
+        self.stack.addWidget(self.tab_giga_diarize)
+        self.stack.addWidget(self.tab_whisper)
 
-        self.setup_giga_tab()
-        self.setup_giga_diarize_tab()
-        self.setup_whisper_tab()
+        right_layout.addWidget(self.stack, 1)
 
         # System Activity Logs Dashboard Terminal
         log_frame = QFrame()
@@ -120,7 +135,17 @@ class VoiceScribeMultiToolApp(QMainWindow):
         self.log_text.setReadOnly(True)
         log_layout.addWidget(self.log_text)
 
-        main_layout.addWidget(log_frame, 1)
+        right_layout.addWidget(log_frame, 1)
+
+        split_layout.addLayout(right_layout, 1)
+        main_layout.addLayout(split_layout, 1)
+
+        self.sidebar.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.sidebar.setCurrentRow(0)
+
+        self.setup_giga_tab()
+        self.setup_giga_diarize_tab()
+        self.setup_whisper_tab()
 
     def setup_giga_tab(self):
         layout = QVBoxLayout(self.tab_giga)

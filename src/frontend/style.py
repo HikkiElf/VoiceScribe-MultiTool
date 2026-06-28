@@ -12,6 +12,30 @@ QFrame#Card {
     border: 1px solid #29292e;
     border-radius: 8px;
 }
+QListWidget#Sidebar {
+    background-color: #121214;
+    border: 1px solid #29292e;
+    border-radius: 8px;
+    padding: 8px 0px;
+    outline: none;
+}
+QListWidget#Sidebar::item {
+    padding: 14px 16px;
+    border-radius: 6px;
+    color: #a0a0a5;
+    margin: 4px 8px;
+    border: none;
+    font-size: 14px;
+}
+QListWidget#Sidebar::item:selected {
+    background-color: #29292e;
+    color: #9871ff;
+    font-weight: bold;
+}
+QListWidget#Sidebar::item:hover:!selected {
+    background-color: #1a1a1e;
+    color: #e1e1e6;
+}
 QTabWidget::pane {
     border: 1px solid #29292e;
     background-color: #1a1a1e;
