@@ -10,18 +10,30 @@ import scipy.io.wavfile as wavf
 import sounddevice as sd
 import torch
 
-# Import MLX variants for the new tab
-from gigaam_mlx import load_model as load_mlx_model, transcribe as transcribe_mlx
-from pyannote.audio import Pipeline
+# Безопасный кроссплатформенный импорт MLX-компонентов и PyAnnote
+try:
+    from gigaam_mlx import load_model as load_mlx_model, transcribe as transcribe_mlx
+    MLX_AVAILABLE = True
+except ImportError:
+    MLX_AVAILABLE = False
+    load_mlx_model, transcribe_mlx = None, None
+
+try:
+    from pyannote.audio import Pipeline
+    PYANNOTE_AVAILABLE = True
+except ImportError:
+    PYANNOTE_AVAILABLE = False
+    Pipeline = None
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QComboBox, QPushButton, QCheckBox, QTextEdit,
-    QFileDialog, QMessageBox, QFrame, QStyle, QProgressBar, QSpinBox, QGroupBox
+    QFileDialog, QMessageBox, QFrame, QStyle, QProgressBar, QSpinBox, QGroupBox,
+    QLineEdit
 )
 
-# Load configuration from .env
+# Загрузка конфигурации из .env
 load_dotenv()
 
 MODEL_NAME = "v3_e2e_rnnt"
@@ -29,7 +41,7 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 5
 SILENCE_THRESHOLD = 0.02
 
-# Modern QSS Theme Stylesheet
+# Модернизированный QSS CSS шаблон стилей
 MODERN_STYLE = """
 QMainWindow {
     background-color: #121214;
@@ -89,7 +101,7 @@ QPushButton#PrimaryAction:disabled {
     background-color: #2a1b4e;
     color: #757575;
 }
-QComboBox, QSpinBox {
+QComboBox, QSpinBox, QLineEdit {
     background-color: #202024;
     border: 1px solid #29292e;
     border-radius: 6px;
@@ -113,6 +125,19 @@ QCheckBox {
 QCheckBox::indicator {
     width: 18px;
     height: 18px;
+}
+QProgressBar {
+    border: 1px solid #29292e;
+    border-radius: 6px;
+    background-color: #0c0c0d;
+    text-align: center;
+    color: #ffffff;
+    font-weight: bold;
+    height: 22px;
+}
+QProgressBar::chunk {
+    background-color: #7c4dff;
+    border-radius: 5px;
 }
 """
 
@@ -265,6 +290,7 @@ class WhisperXWorker(QObject):
 
 class GigaAMDiarizeWorker(QObject):
     log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(bool)
 
     def __init__(self, audio_path, output_txt, hf_token, min_speakers, max_speakers, num_speakers):
@@ -278,18 +304,34 @@ class GigaAMDiarizeWorker(QObject):
 
     def run(self):
         try:
+            self.progress_signal.emit(5)
+            if not MLX_AVAILABLE:
+                self.log_signal.emit("💥 Ошибка: Модуль gigaam_mlx недоступен на текущей системе (требуется Apple Silicon).")
+                self.finished_signal.emit(False)
+                return
+
+            if not PYANNOTE_AVAILABLE:
+                self.log_signal.emit("💥 Ошибка: Модуль pyannote.audio не установлен.")
+                self.finished_signal.emit(False)
+                return
+
             self.log_signal.emit("--> [GigaAM-Diarize] Загрузка модели GigaAM-v3 RNNT (MLX)...")
             model, tokenizer = load_mlx_model(model_type="rnnt")
+            self.progress_signal.emit(20)
 
             self.log_signal.emit("--> [GigaAM-Diarize] Загрузка конвейера диаризации PyAnnote...")
             diarize_pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-community-1",
                 token=self.hf_token
             )
+            self.progress_signal.emit(40)
+
             if torch.backends.mps.is_available():
                 diarize_pipeline.to(torch.device("mps"))
+            elif torch.cuda.is_available():
+                diarize_pipeline.to(torch.device("cuda"))
 
-            # Configure dynamic constraints
+            # Настройка ограничений
             diarize_kwargs = {}
             if self.num_speakers is not None:
                 diarize_kwargs["num_speakers"] = self.num_speakers
@@ -299,18 +341,25 @@ class GigaAMDiarizeWorker(QObject):
                 if self.max_speakers is not None:
                     diarize_kwargs["max_speakers"] = self.max_speakers
 
-            self.log_signal.emit(f"--> [GigaAM-Diarize] Анализ структуры спикеров: {os.path.basename(self.audio_path)}")
+            self.log_signal.emit(f"--> [GigaAM-Diarize] Анализ структуры спикеров (PyAnnote VAD/Embedding)...")
             diarization_output = diarize_pipeline(self.audio_path, **diarize_kwargs)
+            self.progress_signal.emit(65)
 
             self.log_signal.emit("--> [GigaAM-Diarize] Нарезка сегментов и транскрибация через MLX...")
 
+            turns = list(diarization_output.exclusive_speaker_diarization)
+            total_turns = len(turns)
+
             with open(self.output_txt, "w", encoding="utf-8") as f:
-                for turn, speaker in diarization_output.exclusive_speaker_diarization:
+                for idx, (turn, speaker) in enumerate(turns):
                     start_time = turn.start
                     end_time = turn.end
                     duration = end_time - start_time
 
                     if duration < 0.4:
+                        # Расчет прогресса даже при пропуске слишком короткого сегмента
+                        current_pct = int(65 + ((idx + 1) / total_turns) * 35)
+                        self.progress_signal.emit(current_pct)
                         continue
 
                     temp_chunk = f"ui_diarize_chunk_{speaker}_{start_time:.2f}.wav"
@@ -342,6 +391,11 @@ class GigaAMDiarizeWorker(QObject):
                         if os.path.exists(temp_chunk):
                             os.remove(temp_chunk)
 
+                    # Динамическое обновление полосы прогресса
+                    current_pct = int(65 + ((idx + 1) / total_turns) * 35)
+                    self.progress_signal.emit(current_pct)
+
+            self.progress_signal.emit(100)
             self.finished_signal.emit(True)
         except Exception as e:
             self.log_signal.emit(f"💥 Критическая ошибка разделения ролей GigaAM: {e}")
@@ -353,8 +407,8 @@ class ModernTranscriptionApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GigaAM & WhisperX Studio")
-        self.resize(750, 850)
-        self.setMinimumSize(650, 750)
+        self.resize(750, 900)
+        self.setMinimumSize(650, 800)
 
         self.model = None
         self.device_mapping = {}
@@ -380,6 +434,13 @@ class ModernTranscriptionApp(QMainWindow):
         self.log("Инициализация базовой модели GigaAM... Пожалуйста, подождите.")
         self.load_model_async()
 
+        # Проверка доступности MLX на уровне UI
+        if not MLX_AVAILABLE:
+            self.gd_start_btn.setEnabled(False)
+            self.gd_start_btn.setText("❌ GigaAM MLX недоступен на этой ОС (нужен Apple Silicon)")
+            self.log("⚠️ Внимание: библиотека gigaam_mlx не найдена. Вторая вкладка будет заблокирована.")
+
+
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -387,12 +448,39 @@ class ModernTranscriptionApp(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(14)
 
+        # Конфигурационная плашка токена Hugging Face на самом верху
+        token_frame = QFrame()
+        token_frame.setObjectName("Card")
+        token_layout = QHBoxLayout(token_frame)
+        token_layout.setContentsMargins(12, 10, 12, 10)
+        token_layout.addWidget(QLabel("<b>Hugging Face Token (HF_TOKEN):</b>"))
+
+        self.token_input = QLineEdit()
+        self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_input.setPlaceholderText("Вставьте ваш hf_... токен для работы диаризации")
+
+        # Чтение сохраненного токена (с поддержкой старого и нового ключа)
+        saved_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_READ_TOKEN") or ""
+        self.token_input.setText(saved_token)
+        token_layout.addWidget(self.token_input, 1)
+
+        self.btn_toggle_token = QPushButton("Показать")
+        self.btn_toggle_token.setFixedWidth(75)
+        self.btn_toggle_token.clicked.connect(self.toggle_token_visibility)
+        token_layout.addWidget(self.btn_toggle_token)
+
+        btn_save_token = QPushButton("Сохранить в .env")
+        btn_save_token.clicked.connect(self.save_token_to_env)
+        token_layout.addWidget(btn_save_token)
+
+        main_layout.addWidget(token_frame)
+
         # Tabs Setup
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
         self.tab_giga = QWidget()
-        self.tab_giga_diarize = QWidget()  # New Tab
+        self.tab_giga_diarize = QWidget()
         self.tab_whisper = QWidget()
 
         self.tabs.addTab(self.tab_giga, " 🎙️  Живая запись (GigaAM) ")
@@ -423,6 +511,48 @@ class ModernTranscriptionApp(QMainWindow):
         log_layout.addWidget(self.log_text)
 
         main_layout.addWidget(log_frame, 1)
+
+    def toggle_token_visibility(self):
+        if self.token_input.echoMode() == QLineEdit.EchoMode.Password:
+            self.token_input.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.btn_toggle_token.setText("Скрыть")
+        else:
+            self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self.btn_toggle_token.setText("Показать")
+
+    def save_token_to_env(self):
+        token = self.token_input.text().strip()
+        if not token:
+            QMessageBox.warning(self, "Внимание", "Поле токена пустое.")
+            return
+
+        os.environ["HF_TOKEN"] = token
+        env_lines = []
+        has_token = False
+
+        if os.path.exists(".env"):
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    # Убираем старый или текущий ключ, чтобы не дублировать
+                    if line.strip().startswith("HF_TOKEN=") or line.strip().startswith("HUGGING_FACE_READ_TOKEN="):
+                        if not has_token:
+                            env_lines.append(f"HF_TOKEN={token}\n")
+                            has_token = True
+                    else:
+                        env_lines.append(line)
+        else:
+            env_lines.append(f"HF_TOKEN={token}\n")
+
+        if not has_token and os.path.exists(".env"):
+            env_lines.append(f"HF_TOKEN={token}\n")
+
+        try:
+            with open(".env", "w", encoding="utf-8") as f:
+                f.writelines(env_lines)
+            QMessageBox.information(self, "Успех", "Токен успешно сохранен в .env и обновлен в памяти!")
+            self.log("HF_TOKEN успешно перезаписан.")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить .env файл: {e}")
 
     def setup_giga_tab(self):
         layout = QVBoxLayout(self.tab_giga)
@@ -495,7 +625,6 @@ class ModernTranscriptionApp(QMainWindow):
         self.populate_devices()
 
     def setup_giga_diarize_tab(self):
-        """Sets up the UI elements for the new GigaAM Diarization Pipeline layout."""
         layout = QVBoxLayout(self.tab_giga_diarize)
         layout.setSpacing(12)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -540,9 +669,7 @@ class ModernTranscriptionApp(QMainWindow):
         spk_layout = QVBoxLayout(spk_frame)
         spk_layout.addWidget(QLabel("<b>Конфигурация количества спикеров</b>"))
 
-        # Range Rows Layout
         range_layout = QHBoxLayout()
-
         range_layout.addWidget(QLabel("Мин. спикеров:"))
         self.spin_min_spk = QSpinBox()
         self.spin_min_spk.setRange(1, 20)
@@ -554,10 +681,8 @@ class ModernTranscriptionApp(QMainWindow):
         self.spin_max_spk.setRange(1, 20)
         self.spin_max_spk.setValue(6)
         range_layout.addWidget(self.spin_max_spk)
-
         spk_layout.addLayout(range_layout)
 
-        # Precise Exact Lock Option Override Layout
         exact_layout = QHBoxLayout()
         self.chk_exact_spk = QCheckBox("Использовать точное количество спикеров")
         self.chk_exact_spk.stateChanged.connect(self.toggle_exact_speaker_lock)
@@ -568,9 +693,15 @@ class ModernTranscriptionApp(QMainWindow):
         self.spin_exact_spk.setValue(2)
         self.spin_exact_spk.setEnabled(False)
         exact_layout.addWidget(self.spin_exact_spk)
-
         spk_layout.addLayout(exact_layout)
         layout.addWidget(spk_frame)
+
+        # Панель нового прогресс-бара
+        self.gd_progress = QProgressBar()
+        self.gd_progress.setRange(0, 100)
+        self.gd_progress.setValue(0)
+        self.gd_progress.setTextVisible(True)
+        layout.addWidget(self.gd_progress)
 
         # Execution Control Button
         self.gd_start_btn = QPushButton("🚀 Запустить разделение спикеров (GigaAM MLX)")
@@ -619,7 +750,6 @@ class ModernTranscriptionApp(QMainWindow):
         self.wx_json_var = QCheckBox("JSON (Слова)")
         self.wx_vtt_var = QCheckBox("VTT (Web)")
 
-        # Defaults
         for chk in [self.wx_txt_var, self.wx_srt_var, self.wx_tsv_var, self.wx_json_var, self.wx_vtt_var]:
             chk.setChecked(True)
             grid_layout.addWidget(chk)
@@ -812,9 +942,9 @@ class ModernTranscriptionApp(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Выберите хотя бы один формат на выходе!")
             return
 
-        hf_token = os.getenv("HUGGING_FACE_READ_TOKEN")
+        hf_token = self.token_input.text().strip()
         if not hf_token or hf_token.startswith("hf_какой_то_ваш"):
-            QMessageBox.critical(self, "Ошибка токена", "Проверьте валидность HUGGING_FACE_READ_TOKEN в вашем .env файле.")
+            QMessageBox.critical(self, "Ошибка токена", "Проверьте валидность HF_TOKEN в верхней строке интерфейса.")
             return
 
         self.whisper_btn.setEnabled(False)
@@ -847,16 +977,19 @@ class ModernTranscriptionApp(QMainWindow):
             QMessageBox.critical(self, "Ошибка", "Произошла ошибка при выполнении сценария WhisperX. Проверьте консоль логов.")
 
     def start_giga_diarization(self):
+        if not MLX_AVAILABLE:
+            QMessageBox.critical(self, "Ошибка ОС", "Данный функционал доступен исключительно на macOS с чипами Apple Silicon (M1/M2/M3...).")
+            return
+
         if not self.giga_diarize_audio_path or not self.giga_diarize_txt_path:
             QMessageBox.warning(self, "Внимание", "Заполните пути: выберите входной аудиофайл и целевой файл сохранения .txt")
             return
 
-        hf_token = os.getenv("HUGGING_FACE_READ_TOKEN")
+        hf_token = self.token_input.text().strip()
         if not hf_token or hf_token.startswith("hf_какой_то_ваш"):
-            QMessageBox.critical(self, "Ошибка токена", "Проверьте валидность HUGGING_FACE_READ_TOKEN в вашем .env файле.")
+            QMessageBox.critical(self, "Ошибка токена", "Проверьте валидность HF_TOKEN в верхней строке интерфейса.")
             return
 
-        # Read specific parameters bounded to state rules
         if self.chk_exact_spk.isChecked():
             num_spk = self.spin_exact_spk.value()
             min_spk, max_spk = None, None
@@ -864,6 +997,9 @@ class ModernTranscriptionApp(QMainWindow):
             num_spk = None
             min_spk = self.spin_min_spk.value()
             max_spk = self.spin_max_spk.value()
+
+        # Сброс и активация прогресс-бара
+        self.gd_progress.setValue(0)
 
         self.gd_start_btn.setEnabled(False)
         self.gd_start_btn.setText("⏳ Выполняется обработка GigaAM MLX...")
@@ -881,6 +1017,7 @@ class ModernTranscriptionApp(QMainWindow):
 
         self.giga_diarize_thread.started.connect(self.giga_diarize_worker.run)
         self.giga_diarize_worker.log_signal.connect(self.log)
+        self.giga_diarize_worker.progress_signal.connect(self.gd_progress.setValue)
         self.giga_diarize_worker.finished_signal.connect(self.on_giga_diarize_finished)
 
         self.giga_diarize_thread.start()
@@ -894,9 +1031,11 @@ class ModernTranscriptionApp(QMainWindow):
         self.gd_start_btn.setText("🚀 Запустить разделение спикеров (GigaAM MLX)")
 
         if success:
+            self.gd_progress.setValue(100)
             self.log(f"🎉 Успех! Результат сохранен: {self.giga_diarize_txt_path}")
             QMessageBox.information(self, "Готово", f"Разделение ролей через GigaAM MLX успешно завершено!\nФайл: {self.giga_diarize_txt_path}")
         else:
+            self.gd_progress.setValue(0)
             QMessageBox.critical(self, "Ошибка", "Произошла ошибка при выполнении сценария GigaAM MLX. Проверьте консоль логов.")
 
     def closeEvent(self, event):
