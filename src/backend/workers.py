@@ -9,7 +9,7 @@ import sounddevice as sd
 import scipy.io.wavfile as wavf
 import gigaam
 from PyQt6.QtCore import QObject, pyqtSignal
-from .config import MODEL_NAME, SAMPLE_RATE, CHUNK_DURATION, SILENCE_THRESHOLD
+from .config import MODEL_NAME, SAMPLE_RATE, CHUNK_DURATION, SILENCE_THRESHOLD, SILENCE_DURATION
 
 # Cross-platform validation check for MLX components and PyAnnote
 try:
@@ -68,6 +68,8 @@ class LiveTranscriptionWorker(QObject):
     def run(self):
         samples_per_chunk = SAMPLE_RATE * CHUNK_DURATION
         audio_buffer = []
+        silence_samples = 0
+        has_speech = False
 
         try:
             stream = sd.InputStream(
@@ -85,12 +87,36 @@ class LiveTranscriptionWorker(QObject):
                             if self.save_audio:
                                 self.full_audio_data.append(data)
 
+                            # Track continuous silence
+                            if np.max(np.abs(data)) < SILENCE_THRESHOLD:
+                                silence_samples += len(data)
+                            else:
+                                silence_samples = 0
+                                has_speech = True
+
                             current_audio = np.concatenate(audio_buffer, axis=0)
 
-                            if len(current_audio) >= samples_per_chunk:
-                                audio_buffer = []
+                            # Calculate current silence duration in seconds
+                            silence_duration = silence_samples / SAMPLE_RATE
+
+                            # Condition 1: Max chunk duration reached
+                            max_duration_reached = len(current_audio) >= samples_per_chunk
+
+                            # Condition 2: Silence duration reached after some speech was detected
+                            silence_reached = has_speech and (silence_duration >= SILENCE_DURATION)
+
+                            if max_duration_reached or silence_reached:
+                                # Prevent transcribing if the entire buffer is just background noise/silence
                                 if np.max(np.abs(current_audio)) < SILENCE_THRESHOLD:
+                                    audio_buffer = []
+                                    silence_samples = 0
+                                    has_speech = False
                                     continue
+
+                                # Reset states for the next chunk
+                                audio_buffer = []
+                                silence_samples = 0
+                                has_speech = False
 
                                 temp_wav = f"ui_temp_{int(time.time())}.wav"
                                 wavf.write(temp_wav, SAMPLE_RATE, current_audio)
@@ -100,13 +126,14 @@ class LiveTranscriptionWorker(QObject):
                                     text = result.text.strip()
                                     if text:
                                         self.log_signal.emit(f"Распознано: {text}")
-                                        txt_file.write(text + " ")
+                                        txt_file.write(text + "\n")
                                         txt_file.flush()
                                 except Exception as e:
                                     self.log_signal.emit(f"Ошибка инференса: {e}")
                                 finally:
                                     if os.path.exists(temp_wav):
                                         os.remove(temp_wav)
+
                         except queue.Empty:
                             continue
 
@@ -123,7 +150,6 @@ class LiveTranscriptionWorker(QObject):
 
     def stop(self):
         self.is_recording = False
-
 
 class WhisperXWorker(QObject):
     log_signal = pyqtSignal(str)
