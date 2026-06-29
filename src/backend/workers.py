@@ -11,21 +11,12 @@ import gigaam
 from PyQt6.QtCore import QObject, pyqtSignal
 from .config import MODEL_NAME, SAMPLE_RATE, CHUNK_DURATION, SILENCE_THRESHOLD, SILENCE_DURATION
 
-# Cross-platform validation check for MLX components and PyAnnote
-try:
-    from gigaam_mlx import load_model as load_mlx_model, transcribe as transcribe_mlx
-    MLX_AVAILABLE = True
-except ImportError:
-    MLX_AVAILABLE = False
-    load_mlx_model, transcribe_mlx = None, None
-
 try:
     from pyannote.audio import Pipeline
     PYANNOTE_AVAILABLE = True
 except ImportError:
     PYANNOTE_AVAILABLE = False
     Pipeline = None
-
 
 class ModelLoader(QObject):
     finished = pyqtSignal(object)
@@ -37,7 +28,6 @@ class ModelLoader(QObject):
             self.finished.emit(model)
         except Exception as e:
             self.error.emit(str(e))
-
 
 class LiveTranscriptionWorker(QObject):
     log_signal = pyqtSignal(str)
@@ -122,8 +112,25 @@ class LiveTranscriptionWorker(QObject):
                                 wavf.write(temp_wav, SAMPLE_RATE, current_audio)
 
                                 try:
-                                    result = self.model.transcribe(temp_wav)
-                                    text = result.text.strip()
+                                    # Try standard transcribe first
+                                    try:
+                                        result = self.model.transcribe(temp_wav)
+                                    except Exception as transcribe_e:
+                                        # Fallback to longform if the file exceeds standard limits
+                                        if "Too long wav file" in str(transcribe_e) and hasattr(self.model, "transcribe_longform"):
+                                            self.log_signal.emit("⚠️ Аудио слишком длинное, переключаюсь на transcribe_longform...")
+                                            result = self.model.transcribe_longform(temp_wav)
+                                        else:
+                                            raise transcribe_e
+
+                                    # Extract text safely
+                                    if hasattr(result, 'text'):
+                                        text = result.text.strip()
+                                    elif isinstance(result, dict):
+                                        text = result.get("text", "").strip()
+                                    else:
+                                        text = str(result).strip()
+
                                     if text:
                                         self.log_signal.emit(f"Распознано: {text}")
                                         txt_file.write(text + "\n")
@@ -198,7 +205,6 @@ class WhisperXWorker(QObject):
             self.log_signal.emit(f"💥 Ошибка выполнения: {e}")
             self.finished_signal.emit(False)
 
-
 class GigaAMDiarizeWorker(QObject):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
@@ -216,18 +222,14 @@ class GigaAMDiarizeWorker(QObject):
     def run(self):
         try:
             self.progress_signal.emit(5)
-            if not MLX_AVAILABLE:
-                self.log_signal.emit("💥 Ошибка: Модуль gigaam_mlx недоступен на текущей системе (требуется Apple Silicon).")
-                self.finished_signal.emit(False)
-                return
 
             if not PYANNOTE_AVAILABLE:
                 self.log_signal.emit("💥 Ошибка: Модуль pyannote.audio не установлен.")
                 self.finished_signal.emit(False)
                 return
 
-            self.log_signal.emit("--> [GigaAM-Diarize] Загрузка модели GigaAM-v3 RNNT (MLX)...")
-            model, tokenizer = load_mlx_model(model_type="rnnt")
+            self.log_signal.emit("--> [GigaAM-Diarize] Загрузка модели GigaAM...")
+            model = gigaam.load_model(MODEL_NAME)
             self.progress_signal.emit(20)
 
             self.log_signal.emit("--> [GigaAM-Diarize] Загрузка конвейера диаризации PyAnnote...")
@@ -251,11 +253,11 @@ class GigaAMDiarizeWorker(QObject):
                 if self.max_speakers is not None:
                     diarize_kwargs["max_speakers"] = self.max_speakers
 
-            self.log_signal.emit(f"--> [GigaAM-Diarize] Анализ структуры спикеров (PyAnnote VAD/Embedding)...")
+            self.log_signal.emit("--> [GigaAM-Diarize] Анализ структуры спикеров (PyAnnote VAD/Embedding)...")
             diarization_output = diarize_pipeline(self.audio_path, **diarize_kwargs)
             self.progress_signal.emit(65)
 
-            self.log_signal.emit("--> [GigaAM-Diarize] Нарезка сегментов и транскрибация через MLX...")
+            self.log_signal.emit("--> [GigaAM-Diarize] Нарезка сегментов и транскрибация через GigaAM...")
 
             turns = list(diarization_output.exclusive_speaker_diarization)
             total_turns = len(turns)
@@ -284,9 +286,8 @@ class GigaAMDiarizeWorker(QObject):
                     subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                     try:
-                        res = transcribe_mlx(model, tokenizer, temp_chunk)
-                        text = res.get("text", "") if isinstance(res, dict) else str(res)
-                        text = text.strip()
+                        result = model.transcribe(temp_chunk)
+                        text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
 
                         if text:
                             line = f"[{start_time:.2f}s - {end_time:.2f}s] {speaker}: {text}\n"

@@ -8,11 +8,9 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QFrame, QProgressBar, QSpinBox, QLineEdit,
     QListWidget, QStackedWidget
 )
-# Import dependencies from our backend and style config
 from .style import MODERN_STYLE
 from backend.workers import (
-    ModelLoader, LiveTranscriptionWorker, WhisperXWorker, GigaAMDiarizeWorker,
-    MLX_AVAILABLE
+    ModelLoader, LiveTranscriptionWorker, WhisperXWorker, GigaAMDiarizeWorker
 )
 
 class VoiceScribeMultiToolApp(QMainWindow):
@@ -45,11 +43,6 @@ class VoiceScribeMultiToolApp(QMainWindow):
 
         self.log("Инициализация базовой модели GigaAM... Пожалуйста, подождите.")
         self.load_model_async()
-
-        if not MLX_AVAILABLE:
-            self.gd_start_btn.setEnabled(False)
-            self.gd_start_btn.setText("❌ GigaAM MLX недоступен на этой ОС (нужен Apple Silicon)")
-            self.log("⚠️ Внимание: библиотека gigaam_mlx не найдена. Вторая вкладка будет заблокирована.")
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -93,7 +86,7 @@ class VoiceScribeMultiToolApp(QMainWindow):
         self.sidebar.setFixedWidth(240)
 
         self.sidebar.addItem("🎙️ Живая запись (GigaAM)")
-        self.sidebar.addItem("👥 Разделение (GigaAM MLX)")
+        self.sidebar.addItem("👥 Разделение (GigaAM)")
         self.sidebar.addItem("👥 Разделение (WhisperX)")
 
         split_layout.addWidget(self.sidebar)
@@ -287,7 +280,7 @@ class VoiceScribeMultiToolApp(QMainWindow):
         self.gd_progress.setTextVisible(True)
         layout.addWidget(self.gd_progress)
 
-        self.gd_start_btn = QPushButton("🚀 Запустить разделение спикеров (GigaAM MLX)")
+        self.gd_start_btn = QPushButton("🚀 Запустить разделение спикеров (GigaAM)")
         self.gd_start_btn.setObjectName("PrimaryAction")
         self.gd_start_btn.setMinimumHeight(45)
         self.gd_start_btn.clicked.connect(self.start_giga_diarization)
@@ -439,7 +432,7 @@ class VoiceScribeMultiToolApp(QMainWindow):
             self.wx_file_lbl.setText(os.path.basename(file_path))
 
     def browse_giga_diarize_audio(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Выбрать аудио для диризации", "", "Audio Files (*.wav *.mp3 *.m4a)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Выбрать аудио для диаризации", "", "Audio Files (*.wav *.mp3 *.m4a)")
         if file_path:
             self.giga_diarize_audio_path = file_path
             self.gd_audio_lbl.setText(os.path.basename(file_path))
@@ -599,10 +592,6 @@ class VoiceScribeMultiToolApp(QMainWindow):
             QMessageBox.critical(self, "Ошибка", "Произошла ошибка при выполнении сценария WhisperX. Проверьте консоль логов.")
 
     def start_giga_diarization(self):
-        if not MLX_AVAILABLE:
-            QMessageBox.critical(self, "Ошибка ОС", "Данный функционал доступен исключительно на macOS с чипами Apple Silicon (M1/M2/M3...).")
-            return
-
         if not self.giga_diarize_audio_path or not self.giga_diarize_txt_path:
             QMessageBox.warning(self, "Внимание", "Заполните пути: выберите входной аудиофайл и целевой файл сохранения .txt")
             return
@@ -622,7 +611,7 @@ class VoiceScribeMultiToolApp(QMainWindow):
 
         self.gd_progress.setValue(0)
         self.gd_start_btn.setEnabled(False)
-        self.gd_start_btn.setText("⏳ Выполняется обработка GigaAM MLX...")
+        self.gd_start_btn.setText("⏳ Выполняется обработка GigaAM...")
 
         self.giga_diarize_thread = QThread()
         self.giga_diarize_worker = GigaAMDiarizeWorker(
@@ -648,15 +637,15 @@ class VoiceScribeMultiToolApp(QMainWindow):
         self.giga_diarize_thread.wait()
 
         self.gd_start_btn.setEnabled(True)
-        self.gd_start_btn.setText("🚀 Запустить разделение спикеров (GigaAM MLX)")
+        self.gd_start_btn.setText("🚀 Запустить разделение спикеров (GigaAM)")
 
         if success:
             self.gd_progress.setValue(100)
             self.log(f"🎉 Успех! Результат сохранен: {self.giga_diarize_txt_path}")
-            QMessageBox.information(self, "Готово", f"Разделение ролей через GigaAM MLX успешно завершено!\nФайл: {self.giga_diarize_txt_path}")
+            QMessageBox.information(self, "Готово", f"Разделение ролей через GigaAM успешно завершено!\nФайл: {self.giga_diarize_txt_path}")
         else:
             self.gd_progress.setValue(0)
-            QMessageBox.critical(self, "Ошибка", "Произошла ошибка при выполнении сценария GigaAM MLX. Проверьте консоль логов.")
+            QMessageBox.critical(self, "Ошибка", "Произошла ошибка при выполнении сценария GigaAM. Проверьте консоль логов.")
 
     def closeEvent(self, event):
         active_processes = (
